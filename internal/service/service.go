@@ -6,6 +6,8 @@ package service
 import (
 	"bytes"
 	"encoding/xml"
+	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"mime"
@@ -13,10 +15,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/dubyte/dir2opds/opds"
-	"golang.org/x/tools/blog/atom"
 )
 
 func init() {
@@ -25,6 +28,7 @@ func init() {
 	_ = mime.AddExtensionType(".cbz", "application/x-cbz")
 	_ = mime.AddExtensionType(".cbr", "application/x-cbr")
 	_ = mime.AddExtensionType(".fb2", "text/fb2+xml")
+	_ = mime.AddExtensionType(".pdf", "application/pdf")
 }
 
 const (
@@ -32,6 +36,15 @@ const (
 	pathTypeDirOfDirs
 	pathTypeDirOfFiles
 )
+
+var files = []BookFile{}
+
+type BookFile struct {
+	Name     string
+	Path     string
+	Author   string
+	FileInfo fs.FileInfo
+}
 
 type OPDS struct {
 	DirRoot     string
@@ -42,23 +55,100 @@ type OPDS struct {
 
 var TimeNow = timeNowFunc()
 
+const navigationType = "application/atom+xml;profile=opds-catalog;kind=navigation"
+
 // Handler serve the content of a book file or
 // returns an Acquisition Feed when the entries are documents or
 // returns an Navegation Feed when the entries are other folders
 func (s OPDS) Handler(w http.ResponseWriter, req *http.Request) error {
-	fPath := filepath.Join(s.DirRoot, req.URL.Path)
+	var err error
+	urlPath, err := url.PathUnescape(req.URL.Path)
+	if err != nil {
+		log.Printf("error while serving '%s': %s", req.URL.Path, err)
+		return err
+	}
+	fPath := filepath.Join(s.DirRoot, urlPath)
 
+	log.Printf("urlPath:'%s'", urlPath)
 	log.Printf("fPath:'%s'", fPath)
 
-	if getPathType(fPath) == pathTypeFile {
+	feedBuilder := opds.FeedBuilder.
+		ID(urlPath).
+		Title(strings.Title(strings.TrimPrefix(urlPath, "/"))).
+		Author(opds.AuthorBuilder.Name(s.Author).Email(s.AuthorEmail).URI(s.AuthorURI).Build()).
+		Updated(TimeNow()).
+		AddLink(opds.LinkBuilder.Rel("start").Href("/").Type(navigationType).Build())
+
+	if urlPath == "/" {
+		files = []BookFile{}
+		filepath.WalkDir(s.DirRoot, func(path string, de fs.DirEntry, err error) error {
+			if !de.IsDir() {
+				file, err := de.Info()
+				if err != nil {
+					fmt.Println(err)
+					return nil
+				}
+
+				files = append(files, BookFile{
+					Name:     file.Name(),
+					Path:     path,
+					FileInfo: file,
+				})
+			}
+			return nil
+		})
+
+		feedBuilder = feedBuilder.
+			AddEntry(opds.EntryBuilder.
+				ID("/latest").
+				Title("Latest").
+				Updated(TimeNow()).
+				Published(TimeNow()).
+				AddLink(opds.LinkBuilder.Rel(getRel("latest", pathTypeDirOfDirs)).Title("Latest").Href(filepath.Join("/", url.PathEscape("latest"))).Type(getType("Latest", pathTypeDirOfDirs)).Build()).
+				Build()).
+			AddEntry(opds.EntryBuilder.
+				ID("/titles").
+				Title("By Title").
+				Updated(TimeNow()).
+				Published(TimeNow()).
+				AddLink(opds.LinkBuilder.Rel(getRel("titles", pathTypeDirOfDirs)).Title("By Title").Href(filepath.Join("/", url.PathEscape("titles"))).Type(getType("By Title", pathTypeDirOfDirs)).Build()).
+				Build())
+	} else if urlPath == "/latest" {
+		fPath = strings.TrimSuffix(fPath, "/latest")
+		for _, f := range sortByLatest(files) {
+			fi := f.FileInfo
+			pathType := getPathType(f.Path)
+			feedBuilder = feedBuilder.
+				AddEntry(opds.EntryBuilder.
+					ID(urlPath + fi.Name()).
+					Title(fi.Name()).
+					Updated(TimeNow()).
+					Published(TimeNow()).
+					AddLink(opds.LinkBuilder.Rel(getRel(f.Path, pathType)).Title(fi.Name()).Href(filepath.Join("/", url.PathEscape(strings.TrimPrefix(f.Path, s.DirRoot)))).Type(getType(f.Path, pathType)).Build()).
+					Build())
+		}
+	} else if urlPath == "/titles" {
+		fPath = strings.TrimSuffix(fPath, "/titles")
+		for _, f := range sortByTitle(files) {
+			fi := f.FileInfo
+			pathType := getPathType(f.Path)
+			feedBuilder = feedBuilder.
+				AddEntry(opds.EntryBuilder.
+					ID(urlPath + fi.Name()).
+					Title(fi.Name()).
+					Updated(TimeNow()).
+					Published(TimeNow()).
+					AddLink(opds.LinkBuilder.Rel(getRel(f.Path, pathType)).Title(fi.Name()).Href(filepath.Join("/", url.PathEscape(strings.TrimPrefix(f.Path, s.DirRoot)))).Type(getType(f.Path, pathType)).Build()).
+					Build())
+		}
+	} else if getPathType(fPath) == pathTypeFile {
 		http.ServeFile(w, req, fPath)
 		return nil
 	}
 
-	navFeed := s.makeFeed(fPath, req)
+	navFeed := feedBuilder.Build()
 
 	var content []byte
-	var err error
 	if getPathType(fPath) == pathTypeDirOfFiles {
 		acFeed := &opds.AcquisitionFeed{Feed: &navFeed, Dc: "http://purl.org/dc/terms/", Opds: "http://opds-spec.org/2010/catalog"}
 		content, err = xml.MarshalIndent(acFeed, "  ", "    ")
@@ -76,36 +166,6 @@ func (s OPDS) Handler(w http.ResponseWriter, req *http.Request) error {
 	http.ServeContent(w, req, "feed.xml", TimeNow(), bytes.NewReader(content))
 
 	return nil
-}
-
-const navigationType = "application/atom+xml;profile=opds-catalog;kind=navigation"
-
-func (s OPDS) makeFeed(dirpath string, req *http.Request) atom.Feed {
-	feedBuilder := opds.FeedBuilder.
-		ID(req.URL.Path).
-		Title("Catalog in " + req.URL.Path).
-		Author(opds.AuthorBuilder.Name(s.Author).Email(s.AuthorEmail).URI(s.AuthorURI).Build()).
-		Updated(TimeNow()).
-		AddLink(opds.LinkBuilder.Rel("start").Href("/").Type(navigationType).Build())
-
-	fis, _ := ioutil.ReadDir(dirpath)
-	for _, fi := range fis {
-		pathType := getPathType(filepath.Join(dirpath, fi.Name()))
-		feedBuilder = feedBuilder.
-			AddEntry(opds.EntryBuilder.
-				ID(req.URL.Path + fi.Name()).
-				Title(fi.Name()).
-				Updated(TimeNow()).
-				Published(TimeNow()).
-				AddLink(opds.LinkBuilder.
-					Rel(getRel(fi.Name(), pathType)).
-					Title(fi.Name()).
-					Href(filepath.Join(req.URL.RequestURI(), url.PathEscape(fi.Name()))).
-					Type(getType(fi.Name(), pathType)).
-					Build()).
-				Build())
-	}
-	return feedBuilder.Build()
 }
 
 func getRel(name string, pathType int) string {
@@ -158,4 +218,22 @@ func isFile(fi os.FileInfo) bool {
 func timeNowFunc() func() time.Time {
 	t := time.Now()
 	return func() time.Time { return t }
+}
+
+func sortByLatest(files []BookFile) []BookFile {
+	sortedFiles := files
+	sort.Slice(sortedFiles, func(i, j int) bool {
+		return sortedFiles[i].FileInfo.ModTime().After(sortedFiles[j].FileInfo.ModTime())
+	})
+
+	return sortedFiles
+}
+
+func sortByTitle(files []BookFile) []BookFile {
+	sortedFiles := files
+	sort.Slice(sortedFiles, func(i, j int) bool {
+		return strings.Compare(sortedFiles[i].Name, sortedFiles[j].Name) < 0
+	})
+
+	return sortedFiles
 }
