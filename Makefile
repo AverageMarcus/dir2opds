@@ -47,7 +47,7 @@ ci:
 
 .PHONY: release # Release the latest version of the application
 release:
-	@kubectl --namespace dir2opds set image deployment dir2opds web=docker.cluster.fun/averagemarcus/dir2opds:$(SHA)
+	@echo "⚠️ 'release' unimplemented"
 
 .PHONY: help # Show this list of commands
 help:
